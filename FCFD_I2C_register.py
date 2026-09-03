@@ -1,116 +1,40 @@
 import json
 from enum import Enum
-from typing import Type
 import logging
-import ctypes
+from pathlib import Path
 import time
-
-dll = ctypes.WinDLL("USBtoI2Cpro.dll")
-
-# Error handling from dll manual -----------------------------------------------
-ERROR_CODES = {
-    0x00: "No error",
-    0x01: "Address not Acknowledged",
-    0x02: "Data not Acknowledged",
-    0x07: "Arbitration lost",
-    0x08: "I2C Time Out",
-    0x09: "I2C Time Out with no START condition (check bus / pull-ups)",
-    0x0A: "Transmission aborted",
-    0x0B: "Message sent but a Nack was encountered",
-    0x80: "Unsupported function (check firmware version)",
-    0xFF: "Hardware not detected or USB error",
-}
-
-def _describe_error(code: int) -> str:
-    return ERROR_CODES.get(code, f"Unknown error code 0x{code:02X}")
-
-
-
-# Functions from dll manual ----------------------------------------------------
-
-# Returns the firmware version in BCD format: 0x12 = 1.2
-dll.GetFirmwareRevision.argtypes = []
-dll.GetFirmwareRevision.restype = ctypes.c_ubyte
-
-# Returns the number of usb-to-i2c dongles enumerated on the pc
-dll.GetNumberOfDevices.argtypes = []
-dll.GetNumberOfDevices.restype = ctypes.c_int
-
-# Sets the i2c clock freq to the paramater passed int, the real freq set by the fct is returned
-# Max at 1000 kHz and min at 15.7 kHz, discrete values between
-dll.SetI2CFrequency.argtypes = [ctypes.c_int]
-dll.SetI2CFrequency.restype = ctypes.c_int
-
-# No arguments and returns the i2c clock freq
-dll.GetI2CFrequency.argtypes = []
-dll.GetI2CFrequency.restype = ctypes.c_int
-
-# uchar I2CReadArrayDB(uchar board_address, uchar subaaddress_High, uchar subaddress_Low, short int number of Bytes, uchar *ReadData)
-# Number of bytes is capped at 256
-dll.I2CReadArrayDB.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_short, ctypes.POINTER(ctypes.c_ubyte)]
-dll.I2CReadArrayDB.restype = ctypes.c_ubyte
-
-# Same as i2creadarraydb()
-# Number of bytes capped at 500
-dll.I2CWriteArrayDB.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_short, ctypes.POINTER(ctypes.c_ubyte)]
-dll.I2CWriteArrayDB.restype = ctypes.c_ubyte
-
-# Call whenever the application using the DLL is closed
-dll.ShutdownProcedure.argtypes = []
-dll.ShutdownProcedure.restype = None
-
-
-# Basic read and write functions -----------------------------------------------
-def read_fcfd(board_address: int, address: int, n: int):
-    # Read n bytes starting at register 'address', board address is 1 byte, register address is 2
-    # Returns bytes on success, or None on error (prints the reason)
-    buf = (ctypes.c_ubyte * n)()
-    sa_high = (address >> 8) & 0xFF
-    sa_low = address & 0xFF
-
-    err = dll.I2CReadArrayDB(board_address, sa_high, sa_low, n, buf)
-    if err != 0x00:
-        print(f"Read error on register {address}: {_describe_error(err)}")
-        return None
-    return bytes(buf)
-
-def write_fcfd(board_address: int, address: int, data) -> bool:
-    # Write an int or a list of ints into registers starting at the two byte register address 'address'
-    # Returns True on success, False on error (prints the reason).
-    if isinstance(data, int) : data = bytes([data])
-    else: data = bytes(data)
-    n= len(data)
-    buf = (ctypes.c_ubyte * n)(*data)
-    sa_high = (address >> 8) & 0xFF
-    sa_low = address & 0xFF
-
-    err = dll.I2CWriteArrayDB(board_address, sa_high, sa_low, n, buf)
-    if err != 0x00:
-        print(f"Write error on register {address}: {_describe_error(err)}")
-        return False
-    return True
-
-
-
+from typing import List, Optional, Tuple
+from I2C.I2C import I2C
+from I2C.I2C_windows import I2C_windows
+from I2C.I2C_dummy import I2C_dummy
+from typing import Optional, Tuple
+from itertools import product 
 
 class FCFD_I2C_register:
     """
     This class defines the register structure for the FCFD I2C interface. It provides 
     methods to read from and write to the registers, as well as to configure the I2C 
     settings. The class encapsulates the register addresses and their corresponding 
-    values, allowing for easy manipulation of the I2C interface.
+    values, allowing for easy manipulation of the I2C interface. It allows multiple 
+    I2C transports to be used, so long as the I2Cs are with the same register map. 
+    The I2C transport is passed in as a dictionary of board addresses to I2C objects.
+
+    This class uses write, read, and get_number_of_devices methods from the I2C class 
+    to communicate with the hardware.
+    N.B. The write, read functions handles the whole byte(s) of the register, thus the 
+    bit_range is used to put the value in the correct bits of the byte(s) of the register. 
+    The bit_range is a list of [lsb, msb] for each byte in the register.
     """
     class access_type(Enum):
         READ_ONLY = 0
         WRITE_ONLY = 1
         READ_WRITE = 2
     
-    def __init__(self, board_address: int, json_file:str = None):
+    def __init__(self, json_file:str = None, i2cs: dict[int, I2C] = None):
         time.sleep(1)
-        print("Devices found:", dll.GetNumberOfDevices())
+        self.i2cs = i2cs if i2cs is not None else {0x72: I2C_windows(board_address=0x72)}
 
         self._registers = {}
-        self.board_address = board_address
         if json_file is None:
             return
         with open(json_file, 'r') as f:
@@ -146,9 +70,9 @@ class FCFD_I2C_register:
                     f"Address for {register!r} must be list of 1 or 2 elements, currently being {address}"
                 )
 
-            LSA = properties["address"][0]
-            MSA = properties["address"][-1]
-            byte_width = MSA - LSA +1 
+            lsa = properties["address"][0]
+            msa = properties["address"][-1]
+            byte_width = msa - lsa +1 
             bit_range = properties['bit_range']
             # If it is a single byte register bit_range can be
             # 1-d list have 1 element being the bit of the register
@@ -163,7 +87,6 @@ class FCFD_I2C_register:
             # 1-d list have 2 element for the same bits in all bytes
             # 2-d list [n][2], marking the start and end bit of the register in each byte repectively
             else:
-                byte_width = MSA - LSA + 1
                 if not isinstance(bit_range, list) or (
                     len(bit_range) != 2 and not (
                         all(isinstance(entry, list) and len(entry) == 2 for entry in bit_range)
@@ -172,6 +95,9 @@ class FCFD_I2C_register:
                     raise TypeError(
                         f"Bit_range for {register!r} must be a 1-d list of 2 elements or a 2-d list [n][2] for a multi-byte register, currently being {bit_range}"
                     )
+            # format the bit_range into a list of [lsb, msb] for each byte in the register
+            bit_range = self._per_byte_ranges(bit_range, byte_width)
+
 
             # default must be N/A or single integer
             if properties['default'] == 'N/A':
@@ -189,28 +115,23 @@ class FCFD_I2C_register:
                 'bit_range': bit_range,
                 'access': access_type,
                 'default': default,
-                'value': value
             }
 
-    def _per_byte_ranges(self, bit_range, byte_width):
-        # Normalize bit_range into a list of (lsb, msb) tuples, one per byte in the register
+    def _per_byte_ranges(self, bit_range: List, byte_width: int) -> List[List[int]]:
+        # Normalize bit_range into a list of [lsb, msb], one per byte in the register
         # Used by both read and write
-        
         # For a field that covers a single byte
         if byte_width == 1:
             # For a field that covers one bit on one byte
-            if len(bit_range) == 1:
-                return [(bit_range[0], bit_range[0])]
-            # For a field that covers several bits on one byte
-            return [(bit_range[0], bit_range[-1])]
+            return [[bit_range[0], bit_range[-1]]]
         # For a field that covers multiple bytes
         if all(isinstance(entry, list) for entry in bit_range):
             # For a field of multiple bytes where the bit_range is a list of lists eg 'hit_trig_bcid'
-            return [(entry[0], entry[-1]) for entry in bit_range]
+            return [[entry[0], entry[-1]] for entry in bit_range]
         # For a field of multiple bytes where each byte uses the same range of bits eg 'ch5_TDC_data'
-        return [(bit_range[0], bit_range[-1])] * byte_width
+        return [[bit_range[0], bit_range[-1]]] * byte_width
 
-    def write(self, register: str, value: bytearray=bytearray() ) -> bool:
+    def write(self, board_address: int, register: str, value: bytearray=bytearray() ) -> bool:
         # Write byte array to the register
         # If you want to write 0 to register 'write_test' you would do FCFD_I2C_register.write('write_test', [0])
         # Accepts an integer or a byte array-like payload and validates it against the configured bit range before storing the result
@@ -226,10 +147,10 @@ class FCFD_I2C_register:
             logging.debug(f"[FCFD_I2C_register.write] Register {register!r} is read-only")
             return False
 
-        LSA = properties["address"][0]
-        MSA = properties["address"][-1]
+        lsa = properties["address"][0]
+        msa = properties["address"][-1]
         # Number of bytes the register covers
-        byte_width = MSA - LSA +1 
+        byte_width = msa - lsa +1 
 
         if(len(value) != byte_width):
             logging.debug(f"[FCFD_I2C_register.write] Mismatch in register size and value size")
@@ -239,10 +160,9 @@ class FCFD_I2C_register:
 
         # Establish the bit ranges per byte of the register
         bit_range = properties["bit_range"]
-        per_byte = self._per_byte_ranges(bit_range, byte_width)
 
         # Bit-width check between the input value and the available bits
-        for byte_val, (lsb, msb) in zip(value, per_byte):
+        for byte_val, (lsb, msb) in zip(value, bit_range):
             bit_width = msb - lsb + 1
             if byte_val >= ((0b1) << bit_width):
                 logging.debug(f"[FCFD_I2C_register.write] Mismatch in register size and value size")
@@ -256,83 +176,124 @@ class FCFD_I2C_register:
             # Strobe bits have no meaningful state to preserve
             current = bytearray(byte_width)
         else:
-            existing = read_fcfd(self.board_address, LSA, byte_width)
-            if existing is None:
+            error_code, existing = self.i2cs[board_address].read(board_address, lsa, byte_width)
+            if error_code != 0:
                 logging.debug(f"[FCFD_I2C_register.write] Could not read back current value of {register!r} before writing; aborting")
                 return False
             current = bytearray(existing)
  
-        for i, (byte_val, (lsb, msb)) in enumerate(zip(value, per_byte)):
+        for i, (byte_val, (lsb, msb)) in enumerate(zip(value, bit_range)):
             width = msb - lsb + 1
             mask = (1 << width) - 1
             current[i] = (current[i] & ~(mask << lsb) & 0xFF) | ((byte_val & mask) << lsb)
 
         # Actually write the values to the chip
-        if not write_fcfd(self.board_address, LSA, bytes(current)):
+        if not self.i2cs[board_address].write(board_address, lsa, bytes(current)):
             return False
 
-        properties['value'] = value
         return True
 
-    def read(self, register: str) -> bytearray:
+    def read(self, board_address: int, register: str) -> Tuple[int, Optional[bytearray]]:
         # Read the register from hardware and return the field's value(s) as a bytearray
         # Returns None on an unknown register, a write-only register, or an I2C error.
+        # returns a tuple of (error_code, value) where error_code is 0 for success, -1 
+        # for failing sanity checks, and I2C defined error codes for I2C errors. 
+        # 
+        # The value is a bytearray of the register's value(s) if successful, or None if unsuccessful.
+
         
         # Check that the register exists
         if register not in self._registers:
             logging.debug(f"[FCFD_I2C_register.read] Unknown register: {register!r}")
-            return None
+            return -1, None
 
         # Check that the register can be read from
         properties = self._registers[register]
         if properties['access'] == self.access_type.WRITE_ONLY:
             logging.debug(f"[FCFD_I2C_register.read] Register {register!r} is write-only")
-            return None
+            return -1, None
  
-        LSA = properties["address"][0]
-        MSA = properties["address"][-1]
+        lsa = properties["address"][0]
+        msa = properties["address"][-1]
         # How many bytes the register spans
-        byte_width = MSA - LSA + 1
+        byte_width = msa - lsa + 1
 
         # Read the byte values of the register's span
-        raw = read_fcfd(self.board_address, LSA, byte_width)
-        if raw is None:
-            return None
+        error_code, raw = self.i2cs[board_address].read(board_address, lsa, byte_width)
+
+        if error_code != 0:
+            return error_code, None
 
         # Create the bit range per byte in the field's byte span
-        per_byte = self._per_byte_ranges(properties['bit_range'], byte_width)
         extracted = bytearray(byte_width)
         # Split the raw read values into the values for the register
-        for i, (byte_val, (lsb, msb)) in enumerate(zip(raw, per_byte)):
+        for i, (byte_val, (lsb, msb)) in enumerate(zip(raw, properties['bit_range'])):
             width = msb - lsb + 1
             mask = (1 << width) - 1
             extracted[i] = (byte_val >> lsb) & mask
  
-        properties['value'] = extracted
-        return extracted
+        return 0, extracted
 
     # Check that a register matches the desired value
-    def check_reg(self, register: str, data: bytearray=bytearray()) -> bool:
-        check = self.read(register)
-        if check == bytes(data): return True
-        else: return False
+    def check_reg(self, board_address: int, register: str, data: bytearray=bytearray()) -> bool:
+        success, check = self.read(board_address, register)
+        if success == 0 and check == bytes(data):
+            return True
+        else:
+            return False
 
     # Set writeable registers to default values
-    def set_default(self) -> None:
+    def set_default(self, board_address: int) -> None:
         for register in self._registers:
             if self._registers[register]['access'] == self.access_type.READ_ONLY: 
-                print(f'Register {register}: this register is read only.')
+                logging.debug(f'[FCFD_I2C_register.set_default]Register {register}: this register is read only.')
                 continue
             if self._registers[register]['access'] == self.access_type.WRITE_ONLY: 
-                print(f'Register {register}: this register is write only.')
+                logging.debug(f'[FCFD_I2C_register.set_default]Register {register}: this register is write only.')
                 continue
             check = False
             while not check:
                 value = [self._registers[register]['default']]
-                self.write(register, value)
-                check = self.check_reg(register, value)
-            print(f'Register {register}: has been set to it\'s default value.')
-    
+                self.write(board_address, register, value)
+                check = self.check_reg(board_address, register, value)
+            logging.info(f'[FCFD_I2C_register.set_default]Register {register}: has been set to it\'s default value.')
+    # Error code descriptions are provided by the I2C transport, so this function just calls the transport's describe_error method.
+
+    def self_test(self, board_address: int) -> bool:
+        # Perform a self-test by writing and reading back each writable register
+        logging.info("[FCFD_I2C_register.self_test] Starting self-test of read-writable registers")
+        for register, properties in self._registers.items():
+            if properties['access'] != self.access_type.READ_WRITE:
+                continue
+            # loop through all possible values for the register byte and bit range
+            logging.info(f"[FCFD_I2C_register.self_test] Testing register {register!r}")
+            possible_values = [
+                list(range(1 << (msb-lsb+1))) for lsb, msb in properties['bit_range']
+            ]
+            test_values = [bytearray(test_value) for test_value in product(*possible_values)]
+            for test_value in test_values:
+                # Write the test value to the register
+                if not self.write(board_address, register, test_value):
+                    logging.error(f"[FCFD_I2C_register.self_test] Failed to write 0x{test_value.hex()} to {register!r}")
+                    continue
+                # Read back the value from the register
+                error_code, read_value = self.read(board_address, register)
+                if error_code != 0:
+                    if error_code == -1:
+                        logging.error(f"[FCFD_I2C_register.self_test] Failed to read from {register!r}: register is unknown or write-only")
+                    else:
+                        logging.error(f"[FCFD_I2C_register.self_test] Failed to read from {register!r}: {self.describe_error(board_address, error_code)}")
+                    continue
+                # Check that the read value matches the written value
+                else:
+                    logging.debug(f"[FCFD_I2C_register.self_test] Wrote 0x{test_value.hex()} to {register!r}, read back 0x{read_value.hex()}")
+                if read_value != test_value:
+                    logging.error(f"[FCFD_I2C_register.self_test] Mismatch for {register!r}: wrote 0x{test_value.hex()}, read 0x{read_value.hex()}")
+                    continue
+        logging.info("[FCFD_I2C_register.self_test] Finish self-test of read-writable registers")
+        return True
+    def describe_error(self, board_address: int, code: int) -> str:
+        return self.i2cs[board_address].describe_error(code)    
     def __str__(self):
         rtn = ""
         for register, properties in self._registers.items():
@@ -341,21 +302,171 @@ class FCFD_I2C_register:
                 rtn+=f"\t{key}:{value}\n"
         return rtn
 
+def main():
+    import argparse
+    argparser = argparse.ArgumentParser(description="FCFD interface for performing I2C operations",epilog="The script would proceed in the interactive if the --interactive option is specified, otherwise it would perform the operations specified by the other options and exit; if multiple operations are specified, they will be performed in the order of --self-test --set-default, --write, and --read")
+    argparser.add_argument("--json", "-j", type=str, default="./config/config_windows.json", help="Path to the JSON config file")
+    argparser.add_argument("--write", "-w", nargs=2, metavar=("REGISTER", "VALUES"),help="Write to a register, format: register_name,[values]") 
+    argparser.add_argument("--read", "-r", nargs='*', metavar="REGISTER", type=str, help="Read from registers, format: register_names or use all to read all readable registers")
+    argparser.add_argument("--set-default", "-d", action="store_true", help="Set all registers to their default values")
+    argparser.add_argument("--self-test", "-t", action="store_true", help="Run self-test to verify read/write operations")
+    argparser.add_argument("--interactive", "-i", action="store_true", help="Run in interactive mode")
+    argparser.add_argument("--board-address", "-b", nargs='*', type=int, default=None, help="Board addresses to use for I2C operations; if not specified, all board addresses in the config file will be used")
+    argparser.add_argument("--debug", "-D", action="store_true", help="Enable debug logging")
+    argparser.add_argument("--log-file", "-l", type=str, default=None, help="Path to a log file; if not specified, logs will be printed to the console")
+
+    args = argparser.parse_args()
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+    else:
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    if args.log_file:
+        file_handler = logging.FileHandler(args.log_file)
+        file_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(file_handler)
+        
+    config_path = Path(args.json).resolve()
+    if not config_path.is_file():
+        argparser.error(f"config file does not exist: {config_path}")
+
+    with config_path.open('r') as f:
+        config = json.load(f)
+
+    if not config.get("regmap"):
+        argparser.error("no register map specified in config file")
+    regmap_path = Path(config["regmap"])
+    if not regmap_path.is_absolute():
+        regmap_path = config_path.parent / regmap_path
+    regmap_path = regmap_path.resolve()
+    if not regmap_path.is_file():
+        argparser.error(f"register map does not exist: {regmap_path}")
+
+    i2cs = {}
+    for board_address, i2c_type in zip(config["board_addresses"], config["I2C_type"]):
+        if i2c_type == "windows":
+            i2cs[board_address] = I2C_windows(board_address=board_address)
+        elif i2c_type == "dummy":
+            i2cs[board_address] = I2C_dummy(str(regmap_path))
+        else:
+            raise ValueError(f"Unknown I2C type: {i2c_type}")
+    fcfd = FCFD_I2C_register(json_file=str(regmap_path), i2cs=i2cs)
+
+
+    if args.interactive:
+        while True:
+            print("\nEnter a mode:\n'w' -- write,\n'r' --- read,\n'd' --- set to default,\n't' --- self-test,\n'e' --- exit.")
+            mode = input(str())
+            if mode == 'e':
+                return
+            elif mode == 'w':
+                while True:
+                    print("Enter register name and value(s) to write, separated by a space (e.g. 'register_name 0,1,2') or 'e' to return to mode selection:")
+                    user_input = input(str())
+                    if user_input == 'e':
+                        break
+                    try:
+                        register, values_str = user_input.split()
+                        values = [int(v) for v in values_str.split(",")]
+                        if args.board_address is not None:
+                            board_addresses = [args.board_address]
+                        else:
+                            board_addresses = list(i2cs.keys())
+                        for board_address in board_addresses:
+                            if fcfd.write(board_address, register, bytearray(values)):
+                                logging.info(f"Successfully wrote {values} to {register} on board {board_address}")
+                            else:
+                                logging.error(f"Failed to write {values} to {register} on board {board_address}")
+                    except ValueError as e:
+                        print(f"Invalid input: {e}. Please try again.")
+            elif mode == 'r':
+                while True:
+                    print("Enter register name(s) to read, separated by spaces (e.g. 'register1 register2') or 'all' to read all readable registers, or 'e' to return to mode selection:")
+                    user_input = input(str())
+                    if user_input == 'e':
+                        break
+                    registers = user_input.split()
+                    if args.board_address is not None:
+                        board_addresses = [args.board_address]
+                    else:
+                        board_addresses = list(i2cs.keys())
+                    for board_address in board_addresses:
+                        if "all" in registers:
+                            registers = list(fcfd._registers.keys())
+                        for register in registers:
+                            error_code, value = fcfd.read(board_address, register)
+                            if error_code == 0:
+                                logging.info(f"Read from {register} on board {board_address}: {list(value)}")
+                            elif error_code == -1:
+                                logging.error(f"Failed to read from {register} on board {board_address}: register is unknown or write-only")
+                            else:
+                                logging.error(f"Failed to read from {register} on board {board_address}: {fcfd.describe_error(board_address, error_code)}")
+            elif mode == 'd':
+                if args.board_address is not None:
+                    board_addresses = [args.board_address]
+                else:
+                    board_addresses = list(i2cs.keys())
+                for board_address in board_addresses:
+                    fcfd.set_default(board_address)
+            elif mode == 't':
+                if args.board_address is not None:
+                    board_addresses = [args.board_address]
+                else:
+                    board_addresses = list(i2cs.keys())
+                for board_address in board_addresses:
+                    fcfd.self_test(board_address) 
+            else:
+                print('Invalid mode. Please try again.')
+
+    if args.self_test:
+        if args.board_address is not None:
+            board_addresses = [args.board_address]
+        else:
+            board_addresses = list(i2cs.keys())
+        for board_address in board_addresses:
+            fcfd.self_test(board_address)
+
+    if args.set_default:
+        if args.board_address is not None:
+            board_addresses = [args.board_address]
+        else:
+            board_addresses = list(i2cs.keys())
+        for board_address in board_addresses:
+            fcfd.set_default(board_address)
+
+    if args.write:
+        register, values_str = args.write
+        values = [int(v) for v in values_str.split(",")]
+        if args.board_address is not None:
+            board_addresses = [args.board_address]
+        else:
+            board_addresses = list(i2cs.keys())
+        for board_address in board_addresses:
+            if fcfd.write(board_address, register, bytearray(values)):
+                logging.info(f"Successfully wrote {values} to {register} on board {board_address}")
+            else:
+                logging.error(f"Failed to write {values} to {register} on board {board_address}")
+
+    if args.read:
+        registers = args.read
+        if args.board_address is not None:
+            board_addresses = [args.board_address]
+        else:
+            board_addresses = list(i2cs.keys())
+        for board_address in board_addresses:
+            if "all" in registers:
+                registers = list(fcfd._registers.keys())
+        for register in registers:
+            error_code, value = fcfd.read(board_address, register)
+            if error_code == 0:
+                logging.info(f"Read from {register} on board {board_address}: {list(value)}")
+            elif error_code == -1:
+                logging.error(f"Failed to read from {register} on board {board_address}: register is unknown or write-only")
+            else:
+                logging.error(f"Failed to read from {register} on board {board_address}: {fcfd.describe_error(board_address, error_code)}")
+
 if __name__ == "__main__":
-    # Always run these first two lines first to ensure the computer sees the dongle
-    time.sleep(1)
-    print("Devices found:", dll.GetNumberOfDevices())
-
-    i2c = FCFD_I2C_register(0x72, './FCFD_I2C_register_map.json')
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-    logging.debug(i2c)
-    # Now show some error/correct example
-    logging.debug(i2c.write('sadfasfd',[1])) # register doesn't exist
-    logging.debug(i2c.write('wb_error_count')) # read-only
-    logging.debug(i2c.write('clk_enable')) # mis-match
-    logging.debug(i2c.write('clk_enable',[1,1])) # mis-match
-    logging.debug(i2c.write('clk_enable',[11])) # mis-match
-    logging.debug(i2c.write('clk_enable',[1])) # correct, now also hits hardware
-    logging.debug(i2c.read('clk_eq'))
-
-
+    main()
