@@ -1,0 +1,5 @@
+{
+    "regmap": "../regmaps/FCFD_v1.2.json",
+    "board_addresses": [114],
+    "I2C_type": ["windows"]
+}
